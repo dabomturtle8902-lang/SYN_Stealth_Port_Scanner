@@ -1,0 +1,419 @@
+# =======Syn Harcore Python Stealthy Port Scanner=======
+    #1st) I will show you how to make a SYN port scanner in python
+    #I will also show you how to use scapy for packet crafting
+    #First you need to install scapy if you don't have it already
+    #You can install it using pip
+#pip install scapy
+    #if you are using python3 use pip3 install scapy
+    #If you are using linux you might need to install some dependencies
+    #For Debian based systems you can use the following command 
+#sudo apt-get install python3-scapy
+    #Now you can start writing your SYN port scanner
+    #If you are encountering issues installing, make sure you have the latest version of pip
+#pip install --upgrade pip
+    #Now you can use the following code to create a SYN port scanner
+#from scapy.all import
+#pip3 install termcolor tqdm tabulate
+#Import necessary libraries:
+import sys
+import threading
+import time
+import socket
+import argparse
+import concurrent.futures
+import csv
+import json
+import random
+
+from termcolor import colored
+from tqdm import tqdm
+from tabulate import tabulate
+from datetime import datetime
+
+MIN_PORT = 1
+MAX_PORT = 65535
+
+#scappy - use sr instead of sr1 for multiple packets
+#This is a simple SYN port scanner using scapy
+from scapy.all import IP, TCP, sr1, send, conf, RandShort, fragment
+
+#Globals / thread safety
+results_lock = threading.Lock()
+open_results = []  # list of open ports
+closed_results = []  # list of closed ports
+filtered_results = []  # list of filtered ports
+spoofed_decoy_used = {} #dictionary to keep track of decoy usage
+
+#service lookup function
+known_services = {
+    20: "FTP Data",
+    21: "FTP Control",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    67: "DHCP",
+    68: "DHCP",
+    80: "HTTP",
+    110: "POP3",
+    119: "NNTP",
+    123: "NTP",
+    143: "IMAP",
+    161: "SNMP",
+    162: "SNMP Trap",
+    179: "BGP",
+    443: "HTTPS",
+    465: "SMTPS",
+    514: "Syslog",
+    587: "SMTP (Submission)",
+    993: "IMAPS",
+    995: "POP3S",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8080: "HTTP Proxy"
+}
+
+def identify_service(port):
+    return known_services.get(port, "Unknown Service")
+
+#port identify_service(port):
+def parse_port_list(port_string):
+    ports = set()
+    for part in port_string.split(','):
+        if '-' in part:
+            try:
+                a, b = part.split("-", 1)
+                start = int(a.strip()); end = int(b.strip())
+                if start < 1:
+                    start = 1
+                if end > 65535:
+                    end = 65535
+                if start <= end:
+                    ports.update(range(start, end + 1))
+            except Exception:
+                continue
+        else:
+            try:
+                port = int(part.strip())
+                if MIN_PORT <= port <= MAX_PORT:
+                    ports.add(port)
+            except Exception:
+                continue
+    return list(ports)
+def grab_banner(ip, port, timeout=2):
+    try:
+        sock = socket.socket()
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        banner = sock.recv(1024).decode().strip()
+        sock.close()
+        return banner
+    except Exception:
+        return "No Banner"
+
+#OS guess from TTL / Window Size
+def os_guess(ttl, window_size):
+    if ttl >= 128:
+        os_type = "Windows"
+    elif ttl >= 64:
+        os_type = "Linux/Unix"
+    else:
+        os_type = "Unknown"
+    
+    if window_size == 8192:
+        os_detail = "Linux"
+    elif window_size == 65535:
+        os_detail = "Windows"
+    else:
+        os_detail = "Unknown"
+    
+    return f"{os_type} ({os_detail})"
+#==================================================================================
+# Decoy IP Generation Section
+def generate_decoys(num_decoys):
+    decoys = set()
+    while len(decoys) < num_decoys:
+        decoy_ip = ".".join(str(random.randint(1, 254)) for _ in range(4))
+        decoys.add(decoy_ip)
+    return list(decoys)
+#==================================================================================
+# SYN Probe Worker Section (uses sr() for multiple packets)
+def syn_probe(target_ip, target_port, timeout, use_fragmentation, decoys):
+    ip_layer = IP(dst=target_ip)
+    tcp_layer = TCP(sport=RandShort(), dport=target_port, flags="S", seq=1000)
+    packet = ip_layer / tcp_layer
+
+    if use_fragmentation:
+        packet = fragment(packet, fragsize=8)
+
+    #If decoys are used, send packets from decoy IPs
+    if decoys:
+        for decoy in decoys:
+            decoy_ip_layer = IP(src=decoy, dst=target_ip)
+            decoy_packet = decoy_ip_layer / tcp_layer
+            send(decoy_packet, verbose=0)
+
+    response = sr1(packet, timeout=timeout, verbose=0)
+
+    with results_lock:
+        if response is None:
+            filtered_results.append(target_port)
+        elif response.haslayer(TCP):
+            if response.getlayer(TCP).flags == 0x12:  # SYN-ACK
+                open_results.append(target_port)
+                #Send RST to close the connection
+                rst_packet = IP(dst=target_ip) / TCP(sport=response.getlayer(TCP).dport,
+                                                     dport=target_port,
+                                                     flags="R",
+                                                     seq=response.getlayer(TCP).ack)
+                send(rst_packet, verbose=0)
+            elif response.getlayer(TCP).flags == 0x14:  # RST-ACK
+                closed_results.append(target_port)
+        else:
+            filtered_results.append(target_port)
+    # ...existing code...
+    # The following block is not used in the main thread-based scan, but is used in the advanced executor scan
+    # Fix undefined variables and missing imports
+    # Remove duplicate/unused code block
+#==================================================================================
+# Output Results Section (Grouped open-only results)
+def output_results(target_ip, output_format, output_file):
+    if output_format == "table":
+        table_data = []
+        for port in sorted(open_results):
+            service = identify_service(port)
+            table_data.append([port, service])
+        print(tabulate(table_data, headers=["Port", "Service"], tablefmt="grid"))
+    elif output_format == "csv":
+        with open(output_file, "w", newline="") as csvfile:
+            csvwriter = csv.writer(csvfile)
+            csvwriter.writerow(["Port", "Service"])
+            for port in sorted(open_results):
+                service = identify_service(port)
+                csvwriter.writerow([port, service])
+        print(colored(f"[+] Results saved to {output_file}", "green"))
+    elif output_format == "json":
+        json_data = []
+        for port in sorted(open_results):
+            service = identify_service(port)
+            json_data.append({"port": port, "service": service})
+        with open(output_file, "w") as jsonfile:
+            json.dump(json_data, jsonfile, indent=4)
+        print(colored(f"[+] Results saved to {output_file}", "green"))
+def output_detailed_results(results):
+    # Group by target and service
+    grouped = {}
+    for ent in results:
+        if isinstance(ent, dict):
+            tgt = ent.get("target", "")
+            svc = ent.get("service", "Unknown Service")
+            grouped.setdefault(tgt, {})
+            grouped[tgt].setdefault(svc, [])
+            grouped[tgt][svc].append(ent)
+        elif isinstance(ent, int):
+            # If ent is just a port number, group under Unknown target/service
+            grouped.setdefault("Unknown Target", {})
+            grouped["Unknown Target"].setdefault("Unknown Service", [])
+            grouped["Unknown Target"]["Unknown Service"].append({"port": ent})
+    for tgt, svcs in grouped.items():
+        print(colored(f"\n=== {tgt} ===", "cyan"))
+        for svc, entries in svcs.items():
+            header = f"{svc} ({len(entries)} port{'s' if len(entries)!=1 else ''})"
+            print(colored(header, "magenta"))
+            ports_sorted = sorted([ent["port"] for ent in entries if "port" in ent])
+            ports_line = ", ".join(colored(str(p), "green") for p in ports_sorted)
+            print("  " + ports_line)
+            for ent in entries:
+                b = ent.get("banner","") if isinstance(ent, dict) else ""
+                if b:
+                    short = (b[:180] + "...") if len(b) > 180 else b
+                    print("    " + colored(f"banner[{ent['port']}]: ", "cyan") + short)
+#==================================================================================
+# Save Open-only Results Section (JSON/CSV)
+def save_open_results(target_ip, output_format, output_file):
+    if output_format == "csv":
+        with open(output_file, "w", newline="") as csvfile:
+            csvwriter = csv.writer(csvfile)
+            csvwriter.writerow(["Port", "Service"])
+            for port in sorted(open_results):
+                service = identify_service(port)
+                csvwriter.writerow([port, service])
+        print(colored(f"[+] Open ports saved to {output_file}", "green"))
+    elif output_format == "json":
+        json_data = []
+        for port in sorted(open_results):
+            service = identify_service(port)
+            json_data.append({"port": port, "service": service})
+        with open(output_file, "w") as jsonfile:
+            json.dump(json_data, jsonfile, indent=4)
+        print(colored(f"[+] Open ports saved to {output_file}", "green"))
+def save_detailed_results(json_path, csv_path):
+#Save detailed results to JSON and CSV
+    out = {"timestamp": datetime.now().isoformat(), "targets": {}}
+    for ent in open_results:
+        if isinstance(ent, dict):
+            tgt = ent.get("target", "Unknown Target")
+            out["targets"].setdefault(tgt, {})
+            out["targets"][tgt][str(ent.get("port", ""))] = {
+                "service": ent.get("service",""),
+                "banner": ent.get("banner",""),
+                "os_guess": ent.get("os_guess",""),
+                "timestamp": ent.get("timestamp",""),
+                "handshake": ent.get("handshake",""),
+                "decoys": ent.get("decoys", [])
+            }
+    try:
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(out, jf, indent=2)
+        print(colored(f"[+] JSON findings written to {json_path}", "green"))
+    except Exception as e:
+        print(colored(f"[!] Failed to write JSON findings: {e}", "red"))
+
+    try:
+        with open(csv_path, "w", newline='', encoding="utf-8") as cf:
+            writer = csv.writer(cf)
+            writer.writerow(["timestamp","target","port","service","os_guess","handshake","decoys","banner"])
+            for ent in open_results:
+                if isinstance(ent, dict):
+                    writer.writerow([ent.get("timestamp",""), ent.get("target",""), ent.get("port",""),
+                                     ent.get("service",""), ent.get("os_guess",""), ent.get("handshake",""),
+                                     ";".join(ent.get("decoys",[])), ent.get("banner","")])
+        print(colored(f"[+] CSV findings written to {csv_path}", "green"))
+    except Exception as e:
+        print(colored(f"[!] Failed to write CSV findings: {e}", "red"))
+    # summary
+    from collections import defaultdict
+    summary = defaultdict(int)
+    for ent in open_results:
+        if isinstance(ent, dict):
+            summary[ent.get("service", "Unknown Service")] += 1
+    summary_lines = [f"{svc}: {count}" for svc, count in summary.items()]
+    summary_text = " | ".join(summary_lines)
+    print(colored(f"\nSummary: {summary_text}", "cyan"))
+#==================================================================================
+# Main Function & CLI Parsing Section
+def main():
+    ports = []  # Ensure ports is always defined
+    parser = argparse.ArgumentParser(description="Advanced Stealth SYN Scanner (open-only outputs)")
+    parser.add_argument("-t", "--targets", required=True, help="Comma-separated targets (IP or hostnames only, CIDR/ranges not supported)")
+    parser.add_argument("-p", "--ports", required=True, help="Ports like '22,80,443' or ranges '1-1024' or mix")
+    parser.add_argument("--decoys", type=int, default=5, help="Number of decoys (default 5)")
+    parser.add_argument("--fragment", action="store_true", help="Fragment IP packets")
+    parser.add_argument("--timeout", type=float, default=1.0, help="SYN timeout seconds")
+    parser.add_argument("--banner-timeout", type=float, default=1.5, help="Banner grabbing timeout seconds")
+    parser.add_argument("--min-delay", type=float, default=0.01, help="Min jitter delay seconds")
+    parser.add_argument("--max-delay", type=float, default=0.15, help="Max jitter delay seconds")
+    parser.add_argument("--max-threads", type=int, default=150, help="Max concurrent threads")
+    parser.add_argument("-f", "--format", choices=["table", "json"], default="table", help="Output format for terminal")
+    parser.add_argument("-o", "--output", help="Write open-only results to JSON (and CSV alongside) if provided")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode (prints extra info)")
+
+    args = parser.parse_args()
+    target_list = [t.strip() for t in args.targets.split(",") if t.strip()]
+    # Enforce CIDR/range restriction for targets
+    for t in target_list:
+        if "/" in t or "-" in t:
+            print(colored(f"[!] CIDR notation or IP ranges are not supported for targets: '{t}'", "red"))
+            sys.exit(1)
+    ports = parse_port_list(args.ports)
+    decoys = generate_decoys(args.decoys) if args.decoys > 0 else []
+    fragment_packets = args.fragment
+    timeout = args.timeout
+    banner_timeout = args.banner_timeout
+    min_delay = args.min_delay
+    max_delay = args.max_delay
+    max_threads = args.max_threads
+    output_format = args.format
+    output_file = args.output
+    verbose = args.verbose
+    #Start scanning
+    for target in target_list:
+        try:
+            target_ip = socket.gethostbyname(target)
+        except Exception as e:
+            print(colored(f"[!] Could not resolve {target}: {e}", "red"))
+            continue
+
+        print(colored(f"\n[*] Scanning target: {target} ({target_ip})", "cyan"))
+        threads = []
+        for port in ports:
+            t = threading.Thread(target=syn_probe, args=(target_ip, port, timeout, fragment_packets, decoys))
+            threads.append(t)
+            t.start()
+            while threading.active_count() > max_threads:
+                time.sleep(0.01)
+
+            #Jitter delay
+            delay = random.uniform(min_delay, max_delay)
+            time.sleep(delay)
+
+        for t in threads:
+            t.join()
+
+        #Output results
+        output_results(target_ip, output_format, output_file)
+
+        #Save open-only results if output file specified
+        if output_file:
+            json_path = output_file
+            csv_path = output_file.rsplit(".", 1)[0] + ".csv"
+            save_open_results(target_ip, "json", json_path)
+            save_open_results(target_ip, "csv", csv_path)
+     # validate delays and threads
+    if args.min_delay < 0 or args.max_delay < 0 or args.min_delay > args.max_delay:
+        print(colored("[!] Invalid delay values", "red"))
+        sys.exit(1)
+
+    ports = parse_port_list(args.ports)
+    if not ports:
+        print(colored("[!] No valid ports parsed", "red"))
+        sys.exit(1)
+
+    targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    if not targets:
+        print(colored("[!] No valid targets", "red"))
+        sys.exit(1)
+
+    max_workers = max(1, args.max_threads)
+    for target in targets:
+        try:
+            target_ip = socket.gethostbyname(target)
+        except Exception as e:
+            print(colored(f"[!] Could not resolve {target}: {e}", "red"))
+            continue
+
+        print(colored(f"\n[*] Scanning target: {target} ({target_ip})", "cyan"))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for port in ports:
+                futures.append(executor.submit(syn_probe, target_ip, port, args.timeout,
+                                               args.fragment, generate_decoys(args.decoys) if args.decoys > 0 else []))
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures),
+                               desc="Scanning Ports", unit="port"):
+                pass  # Progress bar update
+
+        #Output detailed results
+        output_detailed_results(open_results)
+
+        #Save detailed results if output file specified
+        if args.output:
+            json_path = args.output
+            csv_path = args.output.rsplit(".", 1)[0] + ".csv"
+            save_detailed_results(json_path, csv_path)
+    # reduce aggressive concurrency on localhost to avoid overwhelming the stack
+    # if localhost in targets, cap workers
+    if any(t in ("127.0.0.1", "localhost") for t in targets):
+        max_workers = min(max_workers, 30)
+
+    # Remove duplicate/unused thread pool block
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(colored(f"[!] Unhandled exception: {type(e).__name__}: {e}", "red"))
+        sys.exit(1)
